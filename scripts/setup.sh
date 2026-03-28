@@ -4,7 +4,7 @@
 sudo apt update
 sudo apt install -y ibverbs-providers libibverbs1 ibutils ibverbs-utils \
     rdmacm-utils perftest libibverbs-dev librdmacm-dev infiniband-diags \
-    ninja-build cmake pkg-config build-essential
+    ibacm ninja-build cmake pkg-config build-essential
 
 # 2. Install Clang 23 via the LLVM automatic repository script
 ## This avoids building from source and handles the apt keys for you
@@ -20,6 +20,7 @@ ulimit -n 65536
 # 3. Load Kernel Modules
 sudo modprobe ib_uverbs ib_ipoib rdma_ucm
 sudo modprobe -r ib_ipoib && sudo modprobe ib_ipoib
+sudo systemctl start ibacm || true
 sudo sysctl -w vm.nr_hugepages=2048
 
 # 4. Set all CPU governors to performance when cpufreq is available
@@ -65,3 +66,26 @@ sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-$LLVM_VER
 sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-$LLVM_VER 100
 
 echo "Done! Node configured as $TARGET_IP"
+
+# 7. Verify IB connectivity to other nodes in the 192.168.1.0/24 subnet
+echo ""
+echo "=== IB Connectivity Check ==="
+for i in 1 2 3 4 5; do
+    PEER="192.168.1.$i"
+    if [ "$PEER" = "$TARGET_IP" ]; then
+        continue
+    fi
+    if ping -c 1 -W 1 "$PEER" >/dev/null 2>&1; then
+        echo "  $TARGET_IP -> $PEER : OK"
+    else
+        echo "  $TARGET_IP -> $PEER : UNREACHABLE"
+    fi
+done
+
+# 8. Build the project
+echo ""
+echo "=== Building ==="
+cd /local/rdma || exit
+mkdir -p build && cd build
+cmake -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ .. 2>&1 | tail -3
+make -j$(nproc)

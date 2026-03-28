@@ -21,6 +21,7 @@ public:
 
 protected:
     [[nodiscard]] virtual uint32_t expected_clients() const = 0;
+    virtual void pre_run() {}
     virtual void run() = 0;
 
     void signal_clients_ready();

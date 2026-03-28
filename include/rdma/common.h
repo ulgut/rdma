@@ -23,13 +23,13 @@
 // ─── Cluster config ───
 
 inline const std::vector<std::string> CLUSTER_NODES = {
-    "128.110.96.126",
+    "192.168.1.1",   // node-1 (128.110.96.126)
 };
 
 // change these two variables together
 inline const std::vector<std::string> CLIENT_NODES = {
-    "128.110.96.128",
-    "128.110.96.122",
+    "192.168.1.2",   // node-2 (128.110.96.128)
+    "192.168.1.3",   // node-3 (128.110.96.122)
 };
 
 constexpr size_t TOTAL_CLIENT_MACHINES = 2;

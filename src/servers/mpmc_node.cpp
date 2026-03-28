@@ -4,10 +4,7 @@
 #include <iostream>
 #include <stdexcept>
 
-void MpmcNode::run() {
-    // Initialize the queue region at the start of the server buffer.
-    // This runs after signal_clients_ready() but before clients can issue
-    // their first RDMA op (they're still synchronizing at the latch).
+void MpmcNode::pre_run() {
     auto* base = static_cast<uint8_t*>(buf_);
 
     *reinterpret_cast<volatile uint64_t*>(base + mpmc_tail_offset()) = 0;
@@ -21,7 +18,9 @@ void MpmcNode::run() {
     std::cout << "[MpmcNode " << node_id_ << "] Queue initialized ("
               << MPMC_QUEUE_CAPACITY << " slots, "
               << mpmc_queue_total_size() << " bytes)\n";
+}
 
+void MpmcNode::run() {
     // Passive mode — one-sided ops bypass the server CPU entirely.
     ibv_wc wc[32];
     while (true) {

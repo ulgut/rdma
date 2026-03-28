@@ -1,7 +1,9 @@
 #!/bin/bash
+set -euo pipefail
 
-IS_CLIENT=${1:-0}
-MACHINE_ID=${2:-0}
+IS_CLIENT=${IS_CLIENT:-0}
+MACHINE_ID=${MACHINE_ID:-0}
+MPMC_IS_PRODUCER=${MPMC_IS_PRODUCER:-1}
 
 RAW_ID=$(ifconfig enp8s0d1 | grep 'inet ' | awk '{print $2}' | cut -d'.' -f4)
 
@@ -12,14 +14,7 @@ fi
 
 NODE_ID=$((RAW_ID - 1))
 
-echo "NODE_ID=$NODE_ID | IS_CLIENT=$IS_CLIENT | MACHINE_ID=$MACHINE_ID"
+echo "NODE_ID=$NODE_ID | IS_CLIENT=$IS_CLIENT | MACHINE_ID=$MACHINE_ID | MPMC_IS_PRODUCER=$MPMC_IS_PRODUCER"
 
-cd /local/rdma || exit
-git pull
-mkdir -p build && cd build
-rm -f CMakeCache.txt
-cmake -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ ..
-
-make -j
-
-sudo NODE_ID=$NODE_ID IS_CLIENT=$IS_CLIENT MACHINE_ID=$MACHINE_ID ./rdma
+cd /local/rdma/build || exit
+sudo NODE_ID=$NODE_ID IS_CLIENT=$IS_CLIENT MACHINE_ID=$MACHINE_ID MPMC_IS_PRODUCER=$MPMC_IS_PRODUCER ./rdma

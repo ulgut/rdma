@@ -171,7 +171,7 @@ void Server::start(uint16_t port) {
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    inet_pton(AF_INET, CLUSTER_NODES[node_id_].c_str(), &addr.sin_addr);
 
     if (rdma_bind_addr(listener_, reinterpret_cast<sockaddr*>(&addr)))
         throw std::runtime_error("rdma_bind_addr failed");
@@ -317,6 +317,7 @@ void Server::start(uint16_t port) {
               << (num_nodes - 1) << " peers + "
               << clients_connected << " clients\n";
 
+    pre_run();
     signal_clients_ready();
     run();
 }
