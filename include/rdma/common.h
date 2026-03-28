@@ -23,27 +23,16 @@
 // ─── Cluster config ───
 
 inline const std::vector<std::string> CLUSTER_NODES = {
-    "192.168.1.1",
-    "192.168.1.2",
-    "192.168.1.3",
-    "192.168.1.4",
-    "192.168.1.5",
-    // "192.168.1.6",
-    // "192.168.1.7"
+    "128.110.96.126",
 };
 
 // change these two variables together
 inline const std::vector<std::string> CLIENT_NODES = {
-     // "192.168.1.4",
-   // "192.168.1.5",
-    "192.168.1.6",
-    // "192.168.1.7",
-    // "192.168.1.8",
-    // "192.168.1.9",
-    // "192.168.1.10",
+    "128.110.96.128",
+    "128.110.96.122",
 };
 
-constexpr size_t TOTAL_CLIENT_MACHINES = 1;
+constexpr size_t TOTAL_CLIENT_MACHINES = 2;
 //
 
 inline const size_t QUORUM = (CLUSTER_NODES.size() / 2) + 1;
@@ -62,7 +51,7 @@ constexpr uint8_t RDMA_INITIATOR_DEPTH = 16;
 // ─── Benchmark / workload config ───
 // These knobs define the workload shape shared across all pipelines.
 
-constexpr size_t NUM_OPS = 20'000'000;
+constexpr size_t NUM_OPS = 100'000;
 constexpr size_t NUM_CLIENTS_PER_MACHINE = 16;
 constexpr size_t TOTAL_CLIENTS = NUM_CLIENTS_PER_MACHINE * TOTAL_CLIENT_MACHINES;
 constexpr size_t NUM_OPS_PER_CLIENT = NUM_OPS / TOTAL_CLIENTS;
@@ -139,6 +128,12 @@ constexpr size_t TAS_ACTIVE_WINDOW = 32;
 constexpr size_t TAS_CQ_BATCH = 64;
 constexpr size_t TAS_ROUNDS = 1000;
 constexpr size_t TAS_LOG_CAPACITY = TAS_ROUNDS;
+
+// ─── MPMC pipeline config ───
+// Configurable active window for pipelined push/pop ops.
+
+constexpr size_t MPMC_ACTIVE_WINDOW = 1;
+constexpr size_t MPMC_CQ_BATCH = 32;
 
 // ─── Lock table layout ───
 // The physical server layout is shared even though pipelines use it differently.
@@ -286,6 +281,29 @@ inline void free_hugepage_buffer(void* ptr, const size_t requested_size) noexcep
     if (!ptr) return;
     const size_t aligned_size = huge_page_align(std::max(requested_size, huge_page_size()));
     munmap(ptr, aligned_size);
+}
+
+// ─── MPMC queue layout ───
+// Fixed-length ring buffer hosted on a single server node.
+// Layout: [64B tail] [64B head] [N × 64B slots]
+
+constexpr size_t MPMC_QUEUE_CAPACITY = 1024;
+constexpr size_t MPMC_QUEUE_MASK = MPMC_QUEUE_CAPACITY - 1;
+constexpr size_t MPMC_SLOT_DATA_SIZE = 56;
+constexpr size_t MPMC_SLOT_SIZE = 64; // turn(8) + data(56)
+static_assert((MPMC_QUEUE_CAPACITY & (MPMC_QUEUE_CAPACITY - 1)) == 0,
+              "MPMC queue capacity must be power of 2");
+
+inline constexpr size_t mpmc_tail_offset() { return 0; }
+inline constexpr size_t mpmc_head_offset() { return 64; }
+inline constexpr size_t mpmc_slot_turn_offset(const uint32_t idx) {
+    return 128 + idx * MPMC_SLOT_SIZE;
+}
+inline constexpr size_t mpmc_slot_data_offset(const uint32_t idx) {
+    return 128 + idx * MPMC_SLOT_SIZE + 8;
+}
+inline constexpr size_t mpmc_queue_total_size() {
+    return 128 + MPMC_QUEUE_CAPACITY * MPMC_SLOT_SIZE;
 }
 
 // ─── Sentinel values ───
