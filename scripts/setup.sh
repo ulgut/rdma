@@ -4,7 +4,7 @@
 sudo apt update
 sudo apt install -y ibverbs-providers libibverbs1 ibutils ibverbs-utils \
     rdmacm-utils perftest libibverbs-dev librdmacm-dev infiniband-diags \
-    ibacm ninja-build cmake pkg-config build-essential
+    ibacm ninja-build cmake pkg-config build-essential libstdc++-14-dev
 
 # 2. Install Clang 23 via the LLVM automatic repository script
 ## This avoids building from source and handles the apt keys for you
@@ -14,6 +14,12 @@ sudo apt install -y ibverbs-providers libibverbs1 ibutils ibverbs-utils \
 #rm llvm.sh
 
 sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)"
+
+# Ensure clang can find libstdc++ for linking
+sudo ln -sf /usr/lib/gcc/x86_64-linux-gnu/14/libstdc++.so /usr/lib/x86_64-linux-gnu/libstdc++.so 2>/dev/null \
+    || sudo ln -sf /usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.so /usr/lib/x86_64-linux-gnu/libstdc++.so 2>/dev/null \
+    || sudo ln -sf /usr/lib/gcc/x86_64-linux-gnu/12/libstdc++.so /usr/lib/x86_64-linux-gnu/libstdc++.so 2>/dev/null \
+    || true
 
 ulimit -n 65536
 
@@ -70,7 +76,7 @@ echo "Done! Node configured as $TARGET_IP"
 # 7. Verify IB connectivity to other nodes in the 192.168.1.0/24 subnet
 echo ""
 echo "=== IB Connectivity Check ==="
-for i in 1 2 3 4 5; do
+for i in 16 17 18 19 20; do
     PEER="192.168.1.$i"
     if [ "$PEER" = "$TARGET_IP" ]; then
         continue

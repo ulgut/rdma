@@ -23,13 +23,15 @@
 // ─── Cluster config ───
 
 inline const std::vector<std::string> CLUSTER_NODES = {
-    "192.168.1.1",   // node-1 (128.110.96.126)
+    "192.168.1.16",  // apt126
+    "192.168.1.17",  // apt072
+    "192.168.1.18",  // apt136
 };
 
 // change these two variables together
 inline const std::vector<std::string> CLIENT_NODES = {
-    "192.168.1.2",   // node-2 (128.110.96.128)
-    "192.168.1.3",   // node-3 (128.110.96.122)
+    "192.168.1.19",  // apt123
+    "192.168.1.20",  // apt081
 };
 
 constexpr size_t TOTAL_CLIENT_MACHINES = 2;
@@ -52,7 +54,7 @@ constexpr uint8_t RDMA_INITIATOR_DEPTH = 16;
 // These knobs define the workload shape shared across all pipelines.
 
 constexpr size_t NUM_OPS = 100'000;
-constexpr size_t NUM_CLIENTS_PER_MACHINE = 16;
+constexpr size_t NUM_CLIENTS_PER_MACHINE = 32;
 constexpr size_t TOTAL_CLIENTS = NUM_CLIENTS_PER_MACHINE * TOTAL_CLIENT_MACHINES;
 constexpr size_t NUM_OPS_PER_CLIENT = NUM_OPS / TOTAL_CLIENTS;
 constexpr size_t NUM_TOTAL_OPS = NUM_OPS_PER_CLIENT * TOTAL_CLIENTS;

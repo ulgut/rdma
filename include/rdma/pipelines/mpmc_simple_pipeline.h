@@ -1,8 +1,7 @@
 #pragma once
 
-// Phase-based non-replicated MPMC queue pipeline (Rigtorp-style).
-// Configurable active_window for pipelined push/pop ops.
-// active_window=1 is equivalent to the synchronous version.
+// Non-replicated MPMC bounded queue (Rigtorp-style) over RDMA.
+// Single server, completion-driven state machine with configurable active window.
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +13,7 @@ struct MpmcSimplePipelineConfig {
     size_t queue_capacity = 0;
     size_t active_window = 1;
     size_t cq_batch = 32;
+    size_t num_ops = 0;
 };
 
 [[nodiscard]] MpmcSimplePipelineConfig load_mpmc_simple_pipeline_config();

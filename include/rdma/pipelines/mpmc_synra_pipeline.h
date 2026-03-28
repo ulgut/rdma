@@ -1,8 +1,8 @@
 #pragma once
 
-// Phase-based replicated MPMC queue pipeline (Synra-style).
-// All RDMA ops broadcast to all replicas. Configurable active_window.
-// active_window=1 is equivalent to the synchronous version.
+// Replicated MPMC bounded queue (Rigtorp-style) over RDMA.
+// FAA on primary, CAS-replicate counter to all replicas, then broadcast
+// all subsequent phases. Configurable active window.
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +14,7 @@ struct MpmcSynraPipelineConfig {
     size_t queue_capacity = 0;
     size_t active_window = 1;
     size_t cq_batch = 32;
+    size_t num_ops = 0;
 };
 
 [[nodiscard]] MpmcSynraPipelineConfig load_mpmc_synra_pipeline_config();

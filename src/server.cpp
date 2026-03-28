@@ -186,7 +186,7 @@ void Server::start(uint16_t port) {
         *reinterpret_cast<volatile uint64_t*>(base + lock_turn_offset(i)) = 0;
     }
 
-    const size_t num_nodes = CLUSTER_NODES.size();
+    const size_t num_nodes = expected_servers();
     const uint32_t num_clients = expected_clients();
 
     std::cout << "[Server " << node_id_ << "] Listening on port " << port << "\n";

@@ -1,7 +1,22 @@
 #include "rdma/pipelines/mpmc_synra_pipeline.h"
 
-// Phase-based replicated MPMC queue with configurable active window.
-// All RDMA ops broadcast to all replicas. Completion-driven state machine.
+// Replicated Rigtorp MPMC bounded queue over RDMA (N server replicas).
+//
+// Producer push:
+//   1. FAA(tail) on node 0            — claim position
+//   2. CAS(P, P+1) on replicas 1..N-1 — replicate counter, wait for all
+//   3. CAS-read on all N replicas     — spin on slot turn, advance if any match
+//   4. Write data + CAS turn to all N — publish slot, wait for all
+//
+// Consumer pop:
+//   1. FAA(head) on node 0            — claim position
+//   2. CAS(P, P+1) on replicas 1..N-1 — replicate counter, wait for all
+//   3. CAS-read on all N replicas     — spin on slot turn, advance if any match
+//   4. Read data from node 0          — single replica read
+//   5. CAS turn advance on all N      — recycle slot, wait for all
+//
+// Wait_turn broadcasts to all replicas and collects all completions before
+// checking results. This avoids orphaned CQEs from a first-wins approach.
 
 #include "rdma/client.h"
 #include "rdma/common.h"
@@ -16,19 +31,17 @@
 
 namespace {
 
-// ─── Phase enum ───
-
 enum class MpmcPhase : uint8_t {
-    idle           = 0,
-    claim_position = 1,
-    wait_turn      = 2,
-    write_advance  = 3,
-    read_data      = 4,
-    advance_turn   = 5,
+    idle            = 0,
+    claim_position  = 1,
+    replicate_claim = 2,
+    wait_turn       = 3,
+    write_advance   = 4,
+    read_data       = 5,
+    advance_turn    = 6,
 };
 
-// ─── WR ID encoding ───
-
+// WR id layout: [generation:32][slot:16][phase:8][conn:8]
 constexpr size_t kConnBits = 8;
 
 uint64_t encode_wr_id(uint32_t generation, uint32_t slot, MpmcPhase phase, uint8_t conn) {
@@ -43,22 +56,19 @@ uint32_t wr_slot(uint64_t wr_id) { return static_cast<uint32_t>((wr_id >> 16) & 
 MpmcPhase wr_phase(uint64_t wr_id) { return static_cast<MpmcPhase>((wr_id >> kConnBits) & 0xFFu); }
 uint8_t wr_conn(uint64_t wr_id) { return static_cast<uint8_t>(wr_id & 0xFFu); }
 
-// ─── Op context ───
-
 struct MpmcOpCtx {
     bool active = false;
     uint32_t generation = 0;
     uint32_t slot = 0;
     MpmcPhase phase = MpmcPhase::idle;
     uint64_t position = 0;
-    uint32_t responses = 0;  // completions received for current broadcast phase
+    uint32_t responses = 0;
     size_t latency_index = 0;
     std::chrono::steady_clock::time_point started_at{};
 };
 
-// ─── Buffer layout ───
-// Per active-window slot: [N × 8B atomic results, 64B-aligned][64B data staging]
-
+// Local buffer layout per active-window slot:
+//   [N x 8B atomic results, 64B-aligned] [64B data staging]
 struct MpmcSynraBuffers {
     size_t slot_stride = 0;
     size_t num_replicas = 0;
@@ -73,41 +83,81 @@ struct MpmcSynraBuffers {
     uint8_t* base = nullptr;
 };
 
-// ─── Phase posting helpers ───
-
 void post_claim_position(
     const Client& client, MpmcOpCtx& op, MpmcSynraBuffers& bufs,
     bool is_producer
 ) {
-    const auto& conns = client.connections();
-    auto* results = bufs.atomic_results(op.slot);
+    const auto& node0 = client.connections().front();
+    auto* result = &bufs.atomic_results(op.slot)[0];
     const size_t counter_offset = is_producer ? mpmc_tail_offset() : mpmc_head_offset();
 
-    for (size_t i = 0; i < conns.size(); ++i) {
-        ibv_sge sge{};
-        sge.addr = reinterpret_cast<uintptr_t>(&results[i]);
-        sge.length = sizeof(uint64_t);
-        sge.lkey = client.mr()->lkey;
+    ibv_sge sge{};
+    sge.addr = reinterpret_cast<uintptr_t>(result);
+    sge.length = sizeof(uint64_t);
+    sge.lkey = client.mr()->lkey;
 
-        ibv_send_wr wr{}, *bad = nullptr;
-        wr.wr_id = encode_wr_id(op.generation, op.slot, MpmcPhase::claim_position,
-                                static_cast<uint8_t>(i));
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.atomic.remote_addr = conns[i].addr + counter_offset;
-        wr.wr.atomic.rkey = conns[i].rkey;
-        wr.wr.atomic.compare_add = 1;
+    ibv_send_wr wr{}, *bad = nullptr;
+    wr.wr_id = encode_wr_id(op.generation, op.slot, MpmcPhase::claim_position, 0);
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.atomic.remote_addr = node0.addr + counter_offset;
+    wr.wr.atomic.rkey = node0.rkey;
+    wr.wr.atomic.compare_add = 1;
 
-        if (ibv_post_send(conns[i].id->qp, &wr, &bad))
-            throw std::runtime_error("mpmc_synra: claim FAA post failed");
-    }
+    if (ibv_post_send(node0.id->qp, &wr, &bad))
+        throw std::runtime_error("mpmc_synra: claim FAA post failed");
 
     op.phase = MpmcPhase::claim_position;
+}
+
+// Replicate a single counter update to one replica via CAS(P, P+1).
+// On failure (replica behind), the caller retries this specific replica.
+void post_replicate_claim_single(
+    const Client& client, MpmcOpCtx& op, MpmcSynraBuffers& bufs,
+    uint8_t conn_idx, bool is_producer
+) {
+    const auto& conns = client.connections();
+    const size_t counter_offset = is_producer ? mpmc_tail_offset() : mpmc_head_offset();
+    auto* result = &bufs.atomic_results(op.slot)[conn_idx];
+
+    ibv_sge sge{};
+    sge.addr = reinterpret_cast<uintptr_t>(result);
+    sge.length = sizeof(uint64_t);
+    sge.lkey = client.mr()->lkey;
+
+    ibv_send_wr wr{}, *bad = nullptr;
+    wr.wr_id = encode_wr_id(op.generation, op.slot, MpmcPhase::replicate_claim, conn_idx);
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.atomic.remote_addr = conns[conn_idx].addr + counter_offset;
+    wr.wr.atomic.rkey = conns[conn_idx].rkey;
+    wr.wr.atomic.compare_add = op.position;
+    wr.wr.atomic.swap = op.position + 1;
+
+    if (ibv_post_send(conns[conn_idx].id->qp, &wr, &bad))
+        throw std::runtime_error("mpmc_synra: replicate CAS post failed");
+}
+
+// Post CAS(P, P+1) to all replicas except node 0 (already updated by FAA).
+void post_replicate_claim(
+    const Client& client, MpmcOpCtx& op, MpmcSynraBuffers& bufs,
+    bool is_producer
+) {
+    const auto& conns = client.connections();
+    for (size_t i = 1; i < conns.size(); ++i) {
+        post_replicate_claim_single(client, op, bufs, static_cast<uint8_t>(i), is_producer);
+    }
+    op.phase = MpmcPhase::replicate_claim;
     op.responses = 0;
 }
 
+// Broadcast CAS(expected, expected) to all replicas to check the slot turn.
+// All N completions are collected before checking if any replica returned
+// the expected turn value.
 void post_wait_turn(
     const Client& client, MpmcOpCtx& op, MpmcSynraBuffers& bufs,
     bool is_producer
@@ -143,6 +193,9 @@ void post_wait_turn(
     op.responses = 0;
 }
 
+// Producer: write payload + CAS turn advance to all replicas.
+// Per replica, the unsignaled write is ordered before the signaled CAS
+// on the same QP.
 void post_write_advance(
     const Client& client, MpmcOpCtx& op, MpmcSynraBuffers& bufs
 ) {
@@ -151,14 +204,12 @@ void post_write_advance(
     auto* data = bufs.data_buf(op.slot);
     auto* results = bufs.atomic_results(op.slot);
 
-    // Prepare data
     uint64_t val = (static_cast<uint64_t>(client.id()) << 32)
                  | static_cast<uint32_t>(op.latency_index);
     std::memcpy(data, &val, sizeof(val));
     std::memset(data + sizeof(val), 0, MPMC_SLOT_DATA_SIZE - sizeof(val));
 
     for (size_t i = 0; i < conns.size(); ++i) {
-        // Inline WRITE data (unsignaled — ordered before the next signaled CAS on this QP)
         {
             ibv_sge sge{};
             sge.addr = reinterpret_cast<uintptr_t>(data);
@@ -174,10 +225,9 @@ void post_write_advance(
             wr.wr.rdma.rkey = conns[i].rkey;
 
             if (ibv_post_send(conns[i].id->qp, &wr, &bad))
-                throw std::runtime_error("mpmc_synra: WRITE post failed");
+                throw std::runtime_error("mpmc_synra: write post failed");
         }
 
-        // CAS turn advance: pos → pos+1 (signaled)
         {
             ibv_sge sge{};
             sge.addr = reinterpret_cast<uintptr_t>(&results[i]);
@@ -205,10 +255,10 @@ void post_write_advance(
     op.responses = 0;
 }
 
+// Consumer: read data from node 0 only (all replicas have identical data).
 void post_read_data(
     const Client& client, MpmcOpCtx& op, MpmcSynraBuffers& bufs
 ) {
-    // READ from node 0 only — all replicas have the same data
     const auto& server = client.connections().front();
     const uint32_t idx = static_cast<uint32_t>(op.position & MPMC_QUEUE_MASK);
     auto* data = bufs.data_buf(op.slot);
@@ -228,12 +278,14 @@ void post_read_data(
     wr.wr.rdma.rkey = server.rkey;
 
     if (ibv_post_send(server.id->qp, &wr, &bad))
-        throw std::runtime_error("mpmc_synra: READ post failed");
+        throw std::runtime_error("mpmc_synra: read post failed");
 
     op.phase = MpmcPhase::read_data;
     op.responses = 0;
 }
 
+// Consumer: CAS turn advance on all replicas to recycle the slot.
+// Turn goes from pos + 1 -> pos + capacity.
 void post_advance_turn(
     const Client& client, MpmcOpCtx& op, MpmcSynraBuffers& bufs
 ) {
@@ -270,19 +322,22 @@ void post_advance_turn(
 } // namespace
 
 MpmcSynraPipelineConfig load_mpmc_synra_pipeline_config() {
+    const size_t clients_per_machine = get_uint_env_or("CLIENTS_PER_MACHINE", NUM_CLIENTS_PER_MACHINE);
+    const size_t total_clients = clients_per_machine * TOTAL_CLIENT_MACHINES;
+    const size_t num_ops = get_uint_env_or("NUM_OPS", NUM_OPS);
     return {
         .is_producer = get_uint_env_or("MPMC_IS_PRODUCER", 1) != 0,
         .queue_capacity = MPMC_QUEUE_CAPACITY,
-        .active_window = std::max<size_t>(1, MPMC_ACTIVE_WINDOW),
+        .active_window = std::max<size_t>(1, get_uint_env_or("MPMC_ACTIVE_WINDOW", MPMC_ACTIVE_WINDOW)),
         .cq_batch = std::max<size_t>(1, MPMC_CQ_BATCH),
+        .num_ops = num_ops / total_clients,
     };
 }
 
 size_t mpmc_synra_pipeline_client_buffer_size(const MpmcSynraPipelineConfig& config) {
     const size_t N = CLUSTER_NODES.size();
     const size_t atomic_bytes = align_up(N * sizeof(uint64_t), 64);
-    const size_t data_bytes = 64;
-    const size_t slot_stride = atomic_bytes + data_bytes;
+    const size_t slot_stride = atomic_bytes + 64;
     return align_up(config.active_window * slot_stride + PAGE_SIZE, PAGE_SIZE);
 }
 
@@ -326,13 +381,11 @@ void run_mpmc_synra_pipeline(
         active++;
     };
 
-    // Fill the active window
-    while (active < config.active_window && submitted < NUM_OPS_PER_CLIENT) {
+    while (active < config.active_window && submitted < config.num_ops) {
         submit_op(active);
     }
 
-    // Completion-driven state machine
-    while (completed < NUM_OPS_PER_CLIENT) {
+    while (completed < config.num_ops) {
         const int polled = ibv_poll_cq(client.cq(),
             static_cast<int>(completions.size()), completions.data());
         if (polled < 0)
@@ -356,8 +409,6 @@ void run_mpmc_synra_pipeline(
             const MpmcPhase phase = wr_phase(wc.wr_id);
             if (phase != op.phase) continue;
 
-            op.responses++;
-
             auto finish_op = [&]() {
                 latencies[op.latency_index] = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -366,21 +417,46 @@ void run_mpmc_synra_pipeline(
                 op.phase = MpmcPhase::idle;
                 completed++;
                 active--;
-                if (submitted < NUM_OPS_PER_CLIENT) submit_op(slot);
+                if (submitted < config.num_ops) submit_op(slot);
             };
 
             switch (phase) {
             case MpmcPhase::claim_position:
-                if (op.responses < N) break;
                 op.position = bufs.atomic_results(op.slot)[0];
-                post_wait_turn(client, op, bufs, config.is_producer);
+                if (N > 1) {
+                    post_replicate_claim(client, op, bufs, config.is_producer);
+                } else {
+                    post_wait_turn(client, op, bufs, config.is_producer);
+                }
                 break;
 
+            case MpmcPhase::replicate_claim: {
+                const uint8_t conn = wr_conn(wc.wr_id);
+                const uint64_t old_val = bufs.atomic_results(op.slot)[conn];
+                if (old_val == op.position) {
+                    op.responses++;
+                    if (op.responses >= N - 1) {
+                        post_wait_turn(client, op, bufs, config.is_producer);
+                    }
+                } else {
+                    // Replica behind — a previous client hasn't replicated yet. Retry.
+                    post_replicate_claim_single(client, op, bufs, conn, config.is_producer);
+                }
+                break;
+            }
+
             case MpmcPhase::wait_turn: {
+                op.responses++;
                 if (op.responses < N) break;
+                // All completions collected; check if any replica has the expected turn.
                 const uint64_t expected = config.is_producer
                     ? op.position : op.position + 1;
-                if (bufs.atomic_results(op.slot)[0] == expected) {
+                auto* results = bufs.atomic_results(op.slot);
+                bool ready = false;
+                for (size_t r = 0; r < N; ++r) {
+                    if (results[r] == expected) { ready = true; break; }
+                }
+                if (ready) {
                     if (config.is_producer)
                         post_write_advance(client, op, bufs);
                     else
@@ -392,16 +468,17 @@ void run_mpmc_synra_pipeline(
             }
 
             case MpmcPhase::write_advance:
+                op.responses++;
                 if (op.responses < N) break;
                 finish_op();
                 break;
 
             case MpmcPhase::read_data:
-                // Single completion (node 0 only)
                 post_advance_turn(client, op, bufs);
                 break;
 
             case MpmcPhase::advance_turn:
+                op.responses++;
                 if (op.responses < N) break;
                 finish_op();
                 break;

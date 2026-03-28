@@ -1,7 +1,12 @@
 #include "rdma/pipelines/mpmc_simple_pipeline.h"
 
-// Phase-based non-replicated MPMC queue with configurable active window.
-// Single server. Completion-driven state machine.
+// Non-replicated Rigtorp MPMC bounded queue over RDMA (single server).
+//
+// Producer push: FAA(tail) -> spin on slot turn -> write data + CAS turn advance
+// Consumer pop:  FAA(head) -> spin on slot turn -> read data -> CAS turn advance
+//
+// The spin uses CAS(expected, expected) as a non-destructive remote read.
+// The write is unsignaled inline, ordered before the signaled CAS on the same QP.
 
 #include "rdma/client.h"
 #include "rdma/common.h"
@@ -16,19 +21,16 @@
 
 namespace {
 
-// ─── Phase enum ───
-
 enum class MpmcPhase : uint8_t {
     idle           = 0,
     claim_position = 1,
     wait_turn      = 2,
-    write_advance  = 3,  // producer: inline WRITE + CAS turn advance
-    read_data      = 4,  // consumer: RDMA READ
-    advance_turn   = 5,  // consumer: CAS turn advance
+    write_advance  = 3,
+    read_data      = 4,
+    advance_turn   = 5,
 };
 
-// ─── WR ID encoding ───
-
+// WR id layout: [generation:32][slot:16][phase:8][unused:8]
 constexpr size_t kConnBits = 8;
 
 uint64_t encode_wr_id(uint32_t generation, uint32_t slot, MpmcPhase phase) {
@@ -41,8 +43,6 @@ uint32_t wr_generation(uint64_t wr_id) { return static_cast<uint32_t>(wr_id >> 3
 uint32_t wr_slot(uint64_t wr_id) { return static_cast<uint32_t>((wr_id >> 16) & 0xFFFFu); }
 MpmcPhase wr_phase(uint64_t wr_id) { return static_cast<MpmcPhase>((wr_id >> kConnBits) & 0xFFu); }
 
-// ─── Op context ───
-
 struct MpmcOpCtx {
     bool active = false;
     uint32_t generation = 0;
@@ -53,9 +53,7 @@ struct MpmcOpCtx {
     std::chrono::steady_clock::time_point started_at{};
 };
 
-// ─── Buffer layout ───
-// Per active-window slot: [8B atomic result][56B data staging] = 64B
-
+// Local buffer layout per active-window slot: [8B atomic result | 56B data staging]
 struct MpmcBuffers {
     uint64_t* atomic_result(uint32_t slot) {
         return reinterpret_cast<uint64_t*>(base + slot * 64);
@@ -65,8 +63,6 @@ struct MpmcBuffers {
     }
     uint8_t* base = nullptr;
 };
-
-// ─── Phase posting helpers ───
 
 void post_claim_position(
     const Client& client, MpmcOpCtx& op, MpmcBuffers& bufs,
@@ -97,6 +93,8 @@ void post_claim_position(
     op.phase = MpmcPhase::claim_position;
 }
 
+// CAS(expected, expected) — non-destructive read of the slot turn value.
+// Returns the current turn; caller checks if it matches the expected value.
 void post_wait_turn(
     const Client& client, MpmcOpCtx& op, MpmcBuffers& bufs,
     bool is_producer
@@ -128,6 +126,9 @@ void post_wait_turn(
     op.phase = MpmcPhase::wait_turn;
 }
 
+// Producer: write payload then advance turn in a single post pair.
+// The write is unsignaled inline; the CAS is signaled. RDMA ordering on
+// the same QP guarantees the write completes before the CAS.
 void post_write_advance(
     const Client& client, MpmcOpCtx& op, MpmcBuffers& bufs
 ) {
@@ -136,13 +137,11 @@ void post_write_advance(
     auto* data = bufs.data_buf(op.slot);
     auto* result = bufs.atomic_result(op.slot);
 
-    // Prepare data: encode (client_id, op_index)
     uint64_t val = (static_cast<uint64_t>(client.id()) << 32)
                  | static_cast<uint32_t>(op.latency_index);
     std::memcpy(data, &val, sizeof(val));
     std::memset(data + sizeof(val), 0, MPMC_SLOT_DATA_SIZE - sizeof(val));
 
-    // 1. Inline WRITE data (unsignaled — ordered before the next signaled CAS)
     {
         ibv_sge sge{};
         sge.addr = reinterpret_cast<uintptr_t>(data);
@@ -158,10 +157,10 @@ void post_write_advance(
         wr.wr.rdma.rkey = server.rkey;
 
         if (ibv_post_send(server.id->qp, &wr, &bad))
-            throw std::runtime_error("mpmc_simple: WRITE post failed");
+            throw std::runtime_error("mpmc_simple: write post failed");
     }
 
-    // 2. CAS turn advance: pos → pos+1 (signaled)
+    // Turn advance: pos -> pos + 1 makes the slot visible to consumers
     {
         ibv_sge sge{};
         sge.addr = reinterpret_cast<uintptr_t>(result);
@@ -208,11 +207,13 @@ void post_read_data(
     wr.wr.rdma.rkey = server.rkey;
 
     if (ibv_post_send(server.id->qp, &wr, &bad))
-        throw std::runtime_error("mpmc_simple: READ post failed");
+        throw std::runtime_error("mpmc_simple: read post failed");
 
     op.phase = MpmcPhase::read_data;
 }
 
+// Consumer turn advance: pos + 1 -> pos + capacity, recycling the slot
+// for the next producer round.
 void post_advance_turn(
     const Client& client, MpmcOpCtx& op, MpmcBuffers& bufs
 ) {
@@ -245,16 +246,19 @@ void post_advance_turn(
 } // namespace
 
 MpmcSimplePipelineConfig load_mpmc_simple_pipeline_config() {
+    const size_t clients_per_machine = get_uint_env_or("CLIENTS_PER_MACHINE", NUM_CLIENTS_PER_MACHINE);
+    const size_t total_clients = clients_per_machine * TOTAL_CLIENT_MACHINES;
+    const size_t num_ops = get_uint_env_or("NUM_OPS", NUM_OPS);
     return {
         .is_producer = get_uint_env_or("MPMC_IS_PRODUCER", 1) != 0,
         .queue_capacity = MPMC_QUEUE_CAPACITY,
-        .active_window = std::max<size_t>(1, MPMC_ACTIVE_WINDOW),
+        .active_window = std::max<size_t>(1, get_uint_env_or("MPMC_ACTIVE_WINDOW", MPMC_ACTIVE_WINDOW)),
         .cq_batch = std::max<size_t>(1, MPMC_CQ_BATCH),
+        .num_ops = num_ops / total_clients,
     };
 }
 
 size_t mpmc_simple_pipeline_client_buffer_size(const MpmcSimplePipelineConfig& config) {
-    // Per slot: 64B [8B atomic + 56B data]
     return align_up(config.active_window * 64 + PAGE_SIZE, PAGE_SIZE);
 }
 
@@ -292,13 +296,11 @@ void run_mpmc_simple_pipeline(
         active++;
     };
 
-    // Fill the active window
-    while (active < config.active_window && submitted < NUM_OPS_PER_CLIENT) {
+    while (active < config.active_window && submitted < config.num_ops) {
         submit_op(active);
     }
 
-    // Completion-driven state machine
-    while (completed < NUM_OPS_PER_CLIENT) {
+    while (completed < config.num_ops) {
         const int polled = ibv_poll_cq(client.cq(),
             static_cast<int>(completions.size()), completions.data());
         if (polled < 0)
@@ -330,7 +332,7 @@ void run_mpmc_simple_pipeline(
                 op.phase = MpmcPhase::idle;
                 completed++;
                 active--;
-                if (submitted < NUM_OPS_PER_CLIENT) submit_op(slot);
+                if (submitted < config.num_ops) submit_op(slot);
             };
 
             switch (phase) {

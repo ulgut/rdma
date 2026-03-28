@@ -29,21 +29,23 @@
 // ─── Configuration ───
 // Add new strategies here and wire them into the config load, buffer sizing,
 // dispatch, and summary branches below.
-constexpr const char* STRATEGY = "mpmc_simple";      // "mu", "simple_mu", "ticket_faa", "cas", "simple_cas", "synra_faa", "tas", "mpmc_simple", or "mpmc_synra"
+constexpr const char* DEFAULT_STRATEGY = "mpmc_simple";      // "mu", "simple_mu", "ticket_faa", "cas", "simple_cas", "synra_faa", "tas", "mpmc_simple", or "mpmc_synra"
 
 int main() {
     try {
-        // Each pipeline exposes a config struct plus a client buffer-size helper.
-        // New pipelines should follow that pattern so main stays uniform.
-        const bool is_mu  = (std::string(STRATEGY) == "mu");
-        const bool is_simple_mu = (std::string(STRATEGY) == "simple_mu");
-        const bool is_ticket_faa = (std::string(STRATEGY) == "ticket_faa");
-        const bool is_cas = (std::string(STRATEGY) == "cas");
-        const bool is_simple_cas = (std::string(STRATEGY) == "simple_cas");
-        const bool is_synra_faa = (std::string(STRATEGY) == "synra_faa");
-        const bool is_tas = (std::string(STRATEGY) == "tas");
-        const bool is_mpmc_simple = (std::string(STRATEGY) == "mpmc_simple");
-        const bool is_mpmc_synra = (std::string(STRATEGY) == "mpmc_synra");
+        const char* env_strategy = std::getenv("STRATEGY");
+        const std::string STRATEGY = (env_strategy && std::string(env_strategy).size() > 0)
+            ? std::string(env_strategy) : std::string(DEFAULT_STRATEGY);
+
+        const bool is_mu  = (STRATEGY == "mu");
+        const bool is_simple_mu = (STRATEGY == "simple_mu");
+        const bool is_ticket_faa = (STRATEGY == "ticket_faa");
+        const bool is_cas = (STRATEGY == "cas");
+        const bool is_simple_cas = (STRATEGY == "simple_cas");
+        const bool is_synra_faa = (STRATEGY == "synra_faa");
+        const bool is_tas = (STRATEGY == "tas");
+        const bool is_mpmc_simple = (STRATEGY == "mpmc_simple");
+        const bool is_mpmc_synra = (STRATEGY == "mpmc_synra");
         const bool is_mpmc = is_mpmc_simple || is_mpmc_synra;
         const CasPipelineConfig cas_config = is_cas ? load_cas_pipeline_config() : CasPipelineConfig{};
         const SimpleCasPipelineConfig simple_cas_config =
@@ -60,8 +62,12 @@ int main() {
             is_mpmc_simple ? load_mpmc_simple_pipeline_config() : MpmcSimplePipelineConfig{};
         const MpmcSynraPipelineConfig mpmc_synra_config =
             is_mpmc_synra ? load_mpmc_synra_pipeline_config() : MpmcSynraPipelineConfig{};
-        const size_t latency_count_per_client = is_tas ? tas_pipeline_latency_count(tas_config) : NUM_OPS_PER_CLIENT;
-        const size_t total_local_latency_count = latency_count_per_client * NUM_CLIENTS_PER_MACHINE;
+        const size_t rt_clients_per_machine = get_uint_env_or("CLIENTS_PER_MACHINE", NUM_CLIENTS_PER_MACHINE);
+        const size_t rt_clients = is_mpmc ? rt_clients_per_machine : NUM_CLIENTS_PER_MACHINE;
+        const size_t latency_count_per_client = is_tas ? tas_pipeline_latency_count(tas_config)
+            : (is_mpmc ? (is_mpmc_simple ? mpmc_simple_config.num_ops : mpmc_synra_config.num_ops)
+            : NUM_OPS_PER_CLIENT);
+        const size_t total_local_latency_count = latency_count_per_client * rt_clients;
 
         // Client mode runs worker threads for the selected pipeline. Server mode
         // below launches either the MU leader/follower path or generic nodes.
@@ -69,7 +75,7 @@ int main() {
             const uint32_t machine_id = get_uint_env("MACHINE_ID");
 
             auto all_latencies = std::make_unique<std::vector<uint64_t>>(total_local_latency_count);
-            std::latch start_latch(NUM_CLIENTS_PER_MACHINE + 1);
+            std::latch start_latch(rt_clients + 1);
             std::vector<std::thread> workers;
 
             auto lock_counts = std::make_unique<
@@ -78,8 +84,8 @@ int main() {
 
             std::atomic<Client*> verify_client{nullptr};
 
-            for (uint32_t i = 0; i < NUM_CLIENTS_PER_MACHINE; ++i) {
-                const uint32_t global_id = machine_id * NUM_CLIENTS_PER_MACHINE + i;
+            for (uint32_t i = 0; i < rt_clients; ++i) {
+                const uint32_t global_id = machine_id * rt_clients + i;
 
                 workers.emplace_back(
                     [i, global_id, is_mu, is_simple_mu, is_ticket_faa, is_cas, is_simple_cas,
@@ -318,8 +324,8 @@ int main() {
                 std::cout << "Replication:    " << std::setw(14)
                           << (is_mpmc_synra ? "synra" : "none") << "\n";
             }
-            std::cout << "Clients:        " << std::setw(14) << TOTAL_CLIENTS
-                      << " (" << NUM_CLIENTS_PER_MACHINE << " on this machine)\n";
+            std::cout << "Clients:        " << std::setw(14) << (rt_clients * TOTAL_CLIENT_MACHINES)
+                      << " (" << rt_clients << " on this machine)\n";
             if (is_tas) {
                 std::cout << "Samples/Client: " << std::setw(14) << latency_count_per_client << "\n";
                 std::cout << "Total Samples:  " << std::setw(14) << local_total_ops << "\n";
@@ -365,7 +371,7 @@ int main() {
             std::cout << "\nCSV: "
                       << STRATEGY
                       << "," << machine_id
-                      << "," << TOTAL_CLIENTS
+                      << "," << (rt_clients * TOTAL_CLIENT_MACHINES)
                       << "," << MAX_LOCKS
                       << "," << csv_active_window
                       << "," << std::fixed << std::setprecision(2)
