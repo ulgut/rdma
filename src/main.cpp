@@ -5,10 +5,13 @@
 #include "rdma/servers/simple_mu_leader.h"
 #include "rdma/servers/synra_node.h"
 #include "rdma/servers/mpmc_node.h"
+#include "rdma/servers/mpmc_mu_leader.h"
+#include "rdma/servers/mpmc_mu_follower.h"
 #include "rdma/client.h"
 #include "rdma/pipelines/cas_pipeline.h"
 #include "rdma/pipelines/mpmc_simple_pipeline.h"
 #include "rdma/pipelines/mpmc_synra_pipeline.h"
+#include "rdma/pipelines/mpmc_mu_pipeline.h"
 #include "rdma/pipelines/mu_pipeline.h"
 #include "rdma/pipelines/simple_mu_pipeline.h"
 #include "rdma/pipelines/simple_cas_pipeline.h"
@@ -29,7 +32,7 @@
 // ─── Configuration ───
 // Add new strategies here and wire them into the config load, buffer sizing,
 // dispatch, and summary branches below.
-constexpr const char* DEFAULT_STRATEGY = "mpmc_simple";      // "mu", "simple_mu", "ticket_faa", "cas", "simple_cas", "synra_faa", "tas", "mpmc_simple", or "mpmc_synra"
+constexpr const char* DEFAULT_STRATEGY = "mpmc_simple";      // "mu", "simple_mu", "ticket_faa", "cas", "simple_cas", "synra_faa", "tas", "mpmc_simple", "mpmc_synra", or "mpmc_mu"
 
 int main() {
     try {
@@ -46,7 +49,8 @@ int main() {
         const bool is_tas = (STRATEGY == "tas");
         const bool is_mpmc_simple = (STRATEGY == "mpmc_simple");
         const bool is_mpmc_synra = (STRATEGY == "mpmc_synra");
-        const bool is_mpmc = is_mpmc_simple || is_mpmc_synra;
+        const bool is_mpmc_mu = (STRATEGY == "mpmc_mu");
+        const bool is_mpmc = is_mpmc_simple || is_mpmc_synra || is_mpmc_mu;
         const CasPipelineConfig cas_config = is_cas ? load_cas_pipeline_config() : CasPipelineConfig{};
         const SimpleCasPipelineConfig simple_cas_config =
             is_simple_cas ? load_simple_cas_pipeline_config() : SimpleCasPipelineConfig{};
@@ -62,11 +66,15 @@ int main() {
             is_mpmc_simple ? load_mpmc_simple_pipeline_config() : MpmcSimplePipelineConfig{};
         const MpmcSynraPipelineConfig mpmc_synra_config =
             is_mpmc_synra ? load_mpmc_synra_pipeline_config() : MpmcSynraPipelineConfig{};
+        const MpmcMuPipelineConfig mpmc_mu_config =
+            is_mpmc_mu ? load_mpmc_mu_pipeline_config() : MpmcMuPipelineConfig{};
         const size_t rt_clients_per_machine = get_uint_env_or("CLIENTS_PER_MACHINE", NUM_CLIENTS_PER_MACHINE);
         const size_t rt_clients = is_mpmc ? rt_clients_per_machine : NUM_CLIENTS_PER_MACHINE;
         const size_t latency_count_per_client = is_tas ? tas_pipeline_latency_count(tas_config)
-            : (is_mpmc ? (is_mpmc_simple ? mpmc_simple_config.num_ops : mpmc_synra_config.num_ops)
-            : NUM_OPS_PER_CLIENT);
+            : (is_mpmc_simple ? mpmc_simple_config.num_ops
+            : (is_mpmc_synra ? mpmc_synra_config.num_ops
+            : (is_mpmc_mu ? mpmc_mu_config.num_ops
+            : NUM_OPS_PER_CLIENT)));
         const size_t total_local_latency_count = latency_count_per_client * rt_clients;
 
         // Client mode runs worker threads for the selected pipeline. Server mode
@@ -89,11 +97,11 @@ int main() {
 
                 workers.emplace_back(
                     [i, global_id, is_mu, is_simple_mu, is_ticket_faa, is_cas, is_simple_cas,
-                      is_synra_faa, is_tas, is_mpmc, is_mpmc_simple, is_mpmc_synra,
+                      is_synra_faa, is_tas, is_mpmc, is_mpmc_simple, is_mpmc_synra, is_mpmc_mu,
                       &start_latch, &all_latencies, &lock_counts, &verify_client,
                       &cas_config, &simple_cas_config, &simple_mu_config, &synra_faa_config, &tas_config,
                       &ticket_faa_config, &mu_config, &mpmc_simple_config, &mpmc_synra_config,
-                      latency_count_per_client]() {
+                      &mpmc_mu_config, latency_count_per_client]() {
                         try {
                             pin_thread_to_cpu(pick_cpu_for_client(i));
 
@@ -116,13 +124,15 @@ int main() {
                                 client_buffer_size = mpmc_simple_pipeline_client_buffer_size(mpmc_simple_config);
                             } else if (is_mpmc_synra) {
                                 client_buffer_size = mpmc_synra_pipeline_client_buffer_size(mpmc_synra_config);
+                            } else if (is_mpmc_mu) {
+                                client_buffer_size = mpmc_mu_pipeline_client_buffer_size(mpmc_mu_config);
                             }
 
                             auto client = std::make_unique<Client>(
                                 global_id,
                                 client_buffer_size);
 
-                            if (is_mu || is_simple_mu || is_mpmc_simple) {
+                            if (is_mu || is_simple_mu || is_mpmc_simple || is_mpmc_mu) {
                                 std::vector leader_only = {CLUSTER_NODES[0]};
                                 client->connect(leader_only, RDMA_PORT);
                             } else {
@@ -130,7 +140,7 @@ int main() {
                             }
 
                             {
-                                const size_t num_go = (is_mu || is_simple_mu || is_mpmc_simple) ? 1 : CLUSTER_NODES.size();
+                                const size_t num_go = (is_mu || is_simple_mu || is_mpmc_simple || is_mpmc_mu) ? 1 : CLUSTER_NODES.size();
                                 auto* cq = client->cq();
 
                                 size_t got = 0;
@@ -202,6 +212,12 @@ int main() {
                                     latencies,
                                     (*lock_counts)[global_id].data(),
                                     mpmc_synra_config);
+                            } else if (is_mpmc_mu) {
+                                run_mpmc_mu_pipeline(
+                                    *client,
+                                    latencies,
+                                    (*lock_counts)[global_id].data(),
+                                    mpmc_mu_config);
                             } else {
                                 throw std::runtime_error("Unsupported strategy");
                             }
@@ -314,15 +330,18 @@ int main() {
                 std::cout << "Zipf Skew:      " << std::setw(14) << std::fixed << std::setprecision(2)
                           << mu_config.zipf_skew << "\n";
             } else if (is_mpmc) {
-                const bool is_prod = is_mpmc_simple ? mpmc_simple_config.is_producer : mpmc_synra_config.is_producer;
-                const size_t cap = is_mpmc_simple ? mpmc_simple_config.queue_capacity : mpmc_synra_config.queue_capacity;
-                const size_t aw = is_mpmc_simple ? mpmc_simple_config.active_window : mpmc_synra_config.active_window;
+                const bool is_prod = is_mpmc_mu ? mpmc_mu_config.is_producer
+                    : (is_mpmc_simple ? mpmc_simple_config.is_producer : mpmc_synra_config.is_producer);
+                const size_t cap = is_mpmc_mu ? mpmc_mu_config.queue_capacity
+                    : (is_mpmc_simple ? mpmc_simple_config.queue_capacity : mpmc_synra_config.queue_capacity);
+                const size_t aw = is_mpmc_mu ? mpmc_mu_config.active_window
+                    : (is_mpmc_simple ? mpmc_simple_config.active_window : mpmc_synra_config.active_window);
                 std::cout << "Mode:           " << std::setw(14)
                           << (is_prod ? "producer" : "consumer") << "\n";
                 std::cout << "Queue Capacity: " << std::setw(14) << cap << "\n";
                 std::cout << "Active Window:  " << std::setw(14) << aw << "\n";
                 std::cout << "Replication:    " << std::setw(14)
-                          << (is_mpmc_synra ? "synra" : "none") << "\n";
+                          << (is_mpmc_synra ? "synra" : (is_mpmc_mu ? "mu" : "none")) << "\n";
             }
             std::cout << "Clients:        " << std::setw(14) << (rt_clients * TOTAL_CLIENT_MACHINES)
                       << " (" << rt_clients << " on this machine)\n";
@@ -361,7 +380,8 @@ int main() {
                 : (is_ticket_faa ? ticket_faa_config.active_window
                 : (is_mu ? mu_config.active_window
                 : (is_mpmc_simple ? mpmc_simple_config.active_window
-                : (is_mpmc_synra ? mpmc_synra_config.active_window : 0))))))));
+                : (is_mpmc_synra ? mpmc_synra_config.active_window
+                : (is_mpmc_mu ? mpmc_mu_config.active_window : 0)))))))));
             const double csv_zipf_skew =
                 is_cas ? cas_config.zipf_skew
                 : (is_simple_cas ? simple_cas_config.zipf_skew
@@ -410,6 +430,15 @@ int main() {
                     leader.start(RDMA_PORT);
                 } else {
                     MuFollower follower(node_id, 0, MAX_LOCKS);
+                    follower.start(RDMA_PORT);
+                }
+            } else if (is_mpmc_mu) {
+                pin_thread_to_cpu(0);
+                if (node_id == 0) {
+                    MpmcMuLeader leader(node_id);
+                    leader.start(RDMA_PORT);
+                } else {
+                    MpmcMuFollower follower(node_id);
                     follower.start(RDMA_PORT);
                 }
             } else if (is_mpmc) {

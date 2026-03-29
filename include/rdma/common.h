@@ -137,6 +137,13 @@ constexpr size_t TAS_LOG_CAPACITY = TAS_ROUNDS;
 constexpr size_t MPMC_ACTIVE_WINDOW = 1;
 constexpr size_t MPMC_CQ_BATCH = 32;
 
+// ─── MPMC MU pipeline config ───
+// Leader-based replication: clients SEND/RECV to leader, leader RDMA WRITEs to followers.
+
+constexpr size_t MPMC_MU_ACTIVE_WINDOW = 1;
+constexpr size_t MPMC_MU_CQ_BATCH = 32;
+constexpr uint32_t MPMC_MU_CLIENT_SEND_SIGNAL_EVERY = 64;
+
 // ─── Lock table layout ───
 // The physical server layout is shared even though pipelines use it differently.
 
