@@ -23,18 +23,24 @@
 // ─── Cluster config ───
 
 inline const std::vector<std::string> CLUSTER_NODES = {
-    "192.168.1.16",  // apt126
-    "192.168.1.17",  // apt072
-    "192.168.1.18",  // apt136
+    "10.10.1.1",   // apt083
+    "10.10.1.2",   // apt081
+    "10.10.1.3",   // apt138
 };
 
 // change these two variables together
 inline const std::vector<std::string> CLIENT_NODES = {
-    "192.168.1.19",  // apt123
-    "192.168.1.20",  // apt081
+    "10.10.1.4",   // apt176 (producer)
+    "10.10.1.5",   // apt072 (producer)
+    "10.10.1.6",   // apt161 (producer)
+    "10.10.1.7",   // apt150 (producer)
+    "10.10.1.8",   // apt139 (consumer)
+    "10.10.1.9",   // apt180 (consumer)
+    "10.10.1.10",  // apt177 (consumer)
+    "10.10.1.11",  // apt136 (consumer)
 };
 
-constexpr size_t TOTAL_CLIENT_MACHINES = 2;
+constexpr size_t TOTAL_CLIENT_MACHINES = 8;  // default; override at runtime with env TOTAL_CLIENT_MACHINES
 //
 
 inline const size_t QUORUM = (CLUSTER_NODES.size() / 2) + 1;
@@ -313,6 +319,31 @@ inline constexpr size_t mpmc_slot_data_offset(const uint32_t idx) {
 }
 inline constexpr size_t mpmc_queue_total_size() {
     return 128 + MPMC_QUEUE_CAPACITY * MPMC_SLOT_SIZE;
+}
+
+// ─── MPMC Synra flat replication logs ───
+// Two append-only logs after the queue: one for push claims, one for pop claims.
+// Each entry is 8B. Capacity is set at runtime via NUM_OPS env var.
+// Log starts at mpmc_queue_total_size(), push log first, then pop log.
+
+inline size_t mpmc_synra_log_capacity() {
+    // Half of total ops per direction (pushes vs pops). Add margin.
+    return get_uint_env_or("NUM_OPS", NUM_OPS);
+}
+
+inline size_t mpmc_synra_push_log_offset(uint64_t slot) {
+    return mpmc_queue_total_size() + slot * sizeof(uint64_t);
+}
+
+inline size_t mpmc_synra_pop_log_offset(uint64_t slot) {
+    return mpmc_queue_total_size()
+         + mpmc_synra_log_capacity() * sizeof(uint64_t)
+         + slot * sizeof(uint64_t);
+}
+
+inline size_t mpmc_synra_total_size() {
+    return mpmc_queue_total_size()
+         + 2 * mpmc_synra_log_capacity() * sizeof(uint64_t);
 }
 
 // ─── Sentinel values ───

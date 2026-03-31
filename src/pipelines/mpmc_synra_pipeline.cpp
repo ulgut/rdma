@@ -3,17 +3,17 @@
 // Replicated Rigtorp MPMC bounded queue over RDMA (N server replicas).
 //
 // Producer push:
-//   1. FAA(tail) on node 0            — claim position
-//   2. CAS(P, P+1) on replicas 1..N-1 — replicate counter, wait for all
-//   3. CAS-read on all N replicas     — spin on slot turn, advance if any match
-//   4. Write data + CAS turn to all N — publish slot, wait for all
+//   1. FAA(tail) on node 0                          — claim position P
+//   2. CAS(EMPTY, P) on flat push_log[P] on all N   — replicate claim (synra_faa pattern)
+//   3. CAS-read on all N replicas                   — spin on slot turn, advance if any match
+//   4. Write data + CAS turn to all N               — publish slot, wait for all
 //
 // Consumer pop:
-//   1. FAA(head) on node 0            — claim position
-//   2. CAS(P, P+1) on replicas 1..N-1 — replicate counter, wait for all
-//   3. CAS-read on all N replicas     — spin on slot turn, advance if any match
-//   4. Read data from node 0          — single replica read
-//   5. CAS turn advance on all N      — recycle slot, wait for all
+//   1. FAA(head) on node 0                          — claim position P
+//   2. CAS(EMPTY, P) on flat pop_log[P] on all N    — replicate claim (synra_faa pattern)
+//   3. CAS-read on all N replicas                   — spin on slot turn, advance if any match
+//   4. Read data from node 0                        — single replica read
+//   5. CAS turn advance on all N                    — recycle slot, wait for all
 //
 // Wait_turn broadcasts to all replicas and collects all completions before
 // checking results. This avoids orphaned CQEs from a first-wins approach.
@@ -112,14 +112,16 @@ void post_claim_position(
     op.phase = MpmcPhase::claim_position;
 }
 
-// Replicate a single counter update to one replica via CAS(P, P+1).
-// On failure (replica behind), the caller retries this specific replica.
+// Replicate a single position claim to one replica via CAS(EMPTY_SLOT, position)
+// on the flat replication log. Each position maps to a unique log entry.
 void post_replicate_claim_single(
     const Client& client, MpmcOpCtx& op, MpmcSynraBuffers& bufs,
     uint8_t conn_idx, bool is_producer
 ) {
     const auto& conns = client.connections();
-    const size_t counter_offset = is_producer ? mpmc_tail_offset() : mpmc_head_offset();
+    const size_t log_offset = is_producer
+        ? mpmc_synra_push_log_offset(op.position)
+        : mpmc_synra_pop_log_offset(op.position);
     auto* result = &bufs.atomic_results(op.slot)[conn_idx];
 
     ibv_sge sge{};
@@ -133,22 +135,24 @@ void post_replicate_claim_single(
     wr.num_sge = 1;
     wr.opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
     wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr.atomic.remote_addr = conns[conn_idx].addr + counter_offset;
+    wr.wr.atomic.remote_addr = conns[conn_idx].addr + log_offset;
     wr.wr.atomic.rkey = conns[conn_idx].rkey;
-    wr.wr.atomic.compare_add = op.position;
-    wr.wr.atomic.swap = op.position + 1;
+    wr.wr.atomic.compare_add = EMPTY_SLOT;
+    wr.wr.atomic.swap = op.position;
 
     if (ibv_post_send(conns[conn_idx].id->qp, &wr, &bad))
         throw std::runtime_error("mpmc_synra: replicate CAS post failed");
 }
 
-// Post CAS(P, P+1) to all replicas except node 0 (already updated by FAA).
+// Post CAS(EMPTY_SLOT, position) to ALL replicas on the flat replication log.
+// Like synra_faa: FAA on node 0 gives a unique position, then CAS into the
+// log slot on every replica to record the claim.
 void post_replicate_claim(
     const Client& client, MpmcOpCtx& op, MpmcSynraBuffers& bufs,
     bool is_producer
 ) {
     const auto& conns = client.connections();
-    for (size_t i = 1; i < conns.size(); ++i) {
+    for (size_t i = 0; i < conns.size(); ++i) {
         post_replicate_claim_single(client, op, bufs, static_cast<uint8_t>(i), is_producer);
     }
     op.phase = MpmcPhase::replicate_claim;
@@ -323,7 +327,7 @@ void post_advance_turn(
 
 MpmcSynraPipelineConfig load_mpmc_synra_pipeline_config() {
     const size_t clients_per_machine = get_uint_env_or("CLIENTS_PER_MACHINE", NUM_CLIENTS_PER_MACHINE);
-    const size_t total_clients = clients_per_machine * TOTAL_CLIENT_MACHINES;
+    const size_t total_clients = clients_per_machine * get_uint_env_or("TOTAL_CLIENT_MACHINES", static_cast<unsigned int>(TOTAL_CLIENT_MACHINES));
     const size_t num_ops = get_uint_env_or("NUM_OPS", NUM_OPS);
     return {
         .is_producer = get_uint_env_or("MPMC_IS_PRODUCER", 1) != 0,
@@ -433,14 +437,17 @@ void run_mpmc_synra_pipeline(
             case MpmcPhase::replicate_claim: {
                 const uint8_t conn = wr_conn(wc.wr_id);
                 const uint64_t old_val = bufs.atomic_results(op.slot)[conn];
-                if (old_val == op.position) {
+                if (old_val == EMPTY_SLOT) {
+                    // CAS succeeded — flat log slot was empty, now claimed.
                     op.responses++;
-                    if (op.responses >= N - 1) {
+                    if (op.responses >= N) {
                         post_wait_turn(client, op, bufs, config.is_producer);
                     }
                 } else {
-                    // Replica behind — a previous client hasn't replicated yet. Retry.
-                    post_replicate_claim_single(client, op, bufs, conn, config.is_producer);
+                    throw std::runtime_error(
+                        "mpmc_synra: flat log CAS failed at position "
+                        + std::to_string(op.position) + " replica " + std::to_string(conn)
+                        + " (got " + std::to_string(old_val) + ", expected EMPTY_SLOT)");
                 }
                 break;
             }

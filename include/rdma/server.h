@@ -22,6 +22,7 @@ public:
 protected:
     [[nodiscard]] virtual uint32_t expected_clients() const = 0;
     [[nodiscard]] virtual size_t expected_servers() const { return CLUSTER_NODES.size(); }
+    [[nodiscard]] virtual size_t server_buffer_size() const { return SERVER_ALIGNED_SIZE; }
     virtual void pre_run() {}
     virtual void run() = 0;
 

@@ -18,6 +18,17 @@ void MpmcNode::pre_run() {
     std::cout << "[MpmcNode " << node_id_ << "] Queue initialized ("
               << MPMC_QUEUE_CAPACITY << " slots, "
               << mpmc_queue_total_size() << " bytes)\n";
+
+    const char* strat = std::getenv("STRATEGY");
+    if (strat && std::string(strat) == "mpmc_synra") {
+        const size_t log_cap = mpmc_synra_log_capacity();
+        for (size_t i = 0; i < log_cap; ++i) {
+            *reinterpret_cast<volatile uint64_t*>(base + mpmc_synra_push_log_offset(i)) = EMPTY_SLOT;
+            *reinterpret_cast<volatile uint64_t*>(base + mpmc_synra_pop_log_offset(i)) = EMPTY_SLOT;
+        }
+        std::cout << "[MpmcNode " << node_id_ << "] Synra flat logs initialized ("
+                  << log_cap << " entries/log, " << mpmc_synra_total_size() << " total bytes)\n";
+    }
 }
 
 void MpmcNode::run() {

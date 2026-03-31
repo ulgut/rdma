@@ -53,7 +53,7 @@ Server::~Server() {
     if (mr_)       ibv_dereg_mr(mr_);
     if (cq_)       ibv_destroy_cq(cq_);
     if (pd_)       ibv_dealloc_pd(pd_);
-    if (buf_)      free_hugepage_buffer(buf_, SERVER_ALIGNED_SIZE);
+    if (buf_)      free_hugepage_buffer(buf_, server_buffer_size());
     if (listener_) rdma_destroy_id(listener_);
     if (ec_)       rdma_destroy_event_channel(ec_);
 }
@@ -100,7 +100,7 @@ RemoteConnection Server::connect_to_node(const std::string& ip, uint16_t port) {
                                  nullptr, nullptr, 0);
             if (!cq_) throw std::runtime_error("ibv_create_cq failed");
 
-            mr_ = ibv_reg_mr(pd_, buf_, SERVER_ALIGNED_SIZE,
+            mr_ = ibv_reg_mr(pd_, buf_, server_buffer_size(),
                              IBV_ACCESS_LOCAL_WRITE |
                              IBV_ACCESS_REMOTE_WRITE |
                              IBV_ACCESS_REMOTE_READ |
@@ -178,7 +178,10 @@ void Server::start(uint16_t port) {
     if (rdma_listen(listener_, 32))
         throw std::runtime_error("rdma_listen failed");
 
-    buf_ = allocate_server_buffer();
+    const size_t buf_sz = server_buffer_size();
+    buf_ = allocate_hugepage_buffer(buf_sz);
+    if (!buf_) throw std::runtime_error("Could not allocate server RDMA buffer");
+    std::memset(buf_, 0xFF, buf_sz);
 
     auto* base = static_cast<uint8_t*>(buf_);
     for (uint32_t i = 0; i < MAX_LOCKS; ++i) {
@@ -253,7 +256,7 @@ void Server::start(uint16_t port) {
                                  nullptr, nullptr, 0);
             if (!cq_) throw std::runtime_error("ibv_create_cq failed");
 
-            mr_ = ibv_reg_mr(pd_, buf_, SERVER_ALIGNED_SIZE,
+            mr_ = ibv_reg_mr(pd_, buf_, server_buffer_size(),
                              IBV_ACCESS_LOCAL_WRITE  |
                              IBV_ACCESS_REMOTE_WRITE |
                              IBV_ACCESS_REMOTE_READ  |

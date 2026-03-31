@@ -8,12 +8,17 @@ public:
 
 protected:
     [[nodiscard]] uint32_t expected_clients() const override {
-        return get_uint_env_or("CLIENTS_PER_MACHINE", NUM_CLIENTS_PER_MACHINE) * TOTAL_CLIENT_MACHINES;
+        return get_uint_env_or("CLIENTS_PER_MACHINE", NUM_CLIENTS_PER_MACHINE) * get_uint_env_or("TOTAL_CLIENT_MACHINES", static_cast<unsigned int>(TOTAL_CLIENT_MACHINES));
     }
     [[nodiscard]] size_t expected_servers() const override {
         const char* s = std::getenv("STRATEGY");
         if (s && std::string(s) == "mpmc_simple") return 1;
         return CLUSTER_NODES.size();
+    }
+    [[nodiscard]] size_t server_buffer_size() const override {
+        const char* s = std::getenv("STRATEGY");
+        if (s && std::string(s) == "mpmc_synra") return mpmc_synra_total_size();
+        return SERVER_ALIGNED_SIZE;
     }
     void pre_run() override;
     void run() override;

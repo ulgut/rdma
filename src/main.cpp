@@ -343,7 +343,8 @@ int main() {
                 std::cout << "Replication:    " << std::setw(14)
                           << (is_mpmc_synra ? "synra" : (is_mpmc_mu ? "mu" : "none")) << "\n";
             }
-            std::cout << "Clients:        " << std::setw(14) << (rt_clients * TOTAL_CLIENT_MACHINES)
+            const size_t rt_total_machines = get_uint_env_or("TOTAL_CLIENT_MACHINES", static_cast<unsigned int>(TOTAL_CLIENT_MACHINES));
+            std::cout << "Clients:        " << std::setw(14) << (rt_clients * rt_total_machines)
                       << " (" << rt_clients << " on this machine)\n";
             if (is_tas) {
                 std::cout << "Samples/Client: " << std::setw(14) << latency_count_per_client << "\n";
@@ -391,7 +392,7 @@ int main() {
             std::cout << "\nCSV: "
                       << STRATEGY
                       << "," << machine_id
-                      << "," << (rt_clients * TOTAL_CLIENT_MACHINES)
+                      << "," << (rt_clients * rt_total_machines)
                       << "," << MAX_LOCKS
                       << "," << csv_active_window
                       << "," << std::fixed << std::setprecision(2)

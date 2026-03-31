@@ -247,7 +247,7 @@ void post_advance_turn(
 
 MpmcSimplePipelineConfig load_mpmc_simple_pipeline_config() {
     const size_t clients_per_machine = get_uint_env_or("CLIENTS_PER_MACHINE", NUM_CLIENTS_PER_MACHINE);
-    const size_t total_clients = clients_per_machine * TOTAL_CLIENT_MACHINES;
+    const size_t total_clients = clients_per_machine * get_uint_env_or("TOTAL_CLIENT_MACHINES", static_cast<unsigned int>(TOTAL_CLIENT_MACHINES));
     const size_t num_ops = get_uint_env_or("NUM_OPS", NUM_OPS);
     return {
         .is_producer = get_uint_env_or("MPMC_IS_PRODUCER", 1) != 0,

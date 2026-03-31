@@ -11,7 +11,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 for host in "$@"; do
     echo "Cleaning $host..."
-    ssh "$host" "rm -rf /local/rdma /local/logs && mkdir -p /local/rdma /local/logs"
+    ssh "$host" "sudo rm -rf /local/rdma /local/logs && mkdir -p /local/rdma /local/logs"
     echo "Syncing to $host..."
     rsync -az \
         --exclude build/ \
